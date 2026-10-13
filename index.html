@@ -354,6 +354,8 @@ function detectServer() {
   return gsChecked;
 }
 const geminiOn = () => !!(G.key || GS);
+// Gemini overloaded / rate-limited / unreachable: fall back to the on-device demo methods instead of failing.
+const canFallBack = e => ['busy', 'rate_limited', 'offline'].includes(e && e.code);
 function gErr(code, message) { const e = new Error(message || code); e.code = code; return e; }
 async function gFetch(path, init, signal) {
   let r;
@@ -363,6 +365,7 @@ async function gFetch(path, init, signal) {
   if (!r.ok) {
     const msg = (j && j.error && j.error.message) || ('HTTP ' + r.status), st = j && j.error && j.error.status;
     if (r.status === 429) throw gErr('rate_limited', msg);
+    if ([500, 503, 504].includes(r.status) || /high demand|overloaded|unavailable/i.test(msg)) throw gErr('busy', msg);
     if (/api key/i.test(msg) || r.status === 401 || st === 'PERMISSION_DENIED' || st === 'UNAUTHENTICATED') throw gErr('bad_key', msg);
     if (r.status === 404) throw gErr('model_missing', msg);
     throw gErr('gemini_error', msg);
@@ -377,6 +380,7 @@ async function serverFetch(body, signal) {
   if (!r.ok) {
     const msg = (j && j.error && j.error.message) || ('HTTP ' + r.status), st = j && j.error && j.error.status;
     if (r.status === 429) throw gErr('rate_limited', msg);
+    if ([500, 503, 504].includes(r.status) || /high demand|overloaded|unavailable/i.test(msg)) throw gErr('busy', msg);
     if (st === 'NOT_CONFIGURED') throw gErr('server_unset', msg);
     if (/api key/i.test(msg) || st === 'PERMISSION_DENIED' || st === 'UNAUTHENTICATED') throw gErr('server_key', msg);
     if (r.status === 413) throw gErr('prompt_too_large', msg);
@@ -410,7 +414,11 @@ function geminiSample() {
     const body = { contents: [{ role: 'user', parts }], generationConfig: Object.assign({ temperature: .4 }, json ? { responseMimeType: 'application/json' } : {}) };
     let j;
     try { j = viaServer ? await serverFetch(body, opts.signal) : await gFetch('models/' + G.model + ':generateContent', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, opts.signal); }
-    catch (e) { if (e.code === 'model_missing' && !retried && !viaServer) { G.model = ''; return gen(prompt, opts, json, true); } throw e; }
+    catch (e) {
+      if (e.code === 'model_missing' && !retried && !viaServer) { G.model = ''; return gen(prompt, opts, json, true); }
+      if (e.code === 'busy' && !retried && !viaServer) { await new Promise(r => setTimeout(r, 1000)); return gen(prompt, opts, json, true); }
+      throw e;
+    }
     if (j && j.promptFeedback && j.promptFeedback.blockReason) throw gErr(opts.images ? 'image_rejected' : 'gemini_error', 'Gemini blocked the request (' + j.promptFeedback.blockReason + ')');
     const c = j && j.candidates && j.candidates[0];
     const text = c && c.content && c.content.parts ? c.content.parts.map(p => p.text || '').join('') : '';
@@ -439,6 +447,7 @@ function errCopy(e) {
   if (c === 'offline') return 'Couldn’t reach Gemini. Check your internet connection and try again.';
   if (c === 'model_missing') return 'No usable Gemini model was found for the key. Check GEMINI_MODEL in Vercel, or remove it so one is picked automatically.';
   if (c === 'gemini_error') return 'Gemini couldn’t answer: ' + ((e && e.message) || 'unknown error') + '.';
+  if (c === 'busy') return 'Gemini is very busy right now. Try again in a minute.';
   if (c === 'rate_limited') return 'Too many requests at once. Wait a moment and try again.';
   if (c === 'image_rejected') return 'That photo couldn’t be read. Try a clearer, well-lit shot of the whole receipt.';
   if (c === 'images_unavailable') return 'Photo reading isn’t available here. Import the order text or add items by hand.';
@@ -872,17 +881,18 @@ async function handleReceipt(f) {
   addCtl = new AbortController(); const sig = addCtl.signal;
   const sample = await getSample();
   const lim = sample ? await sample.limits().catch(() => null) : null;
-  let done = false;
+  let done = false, busyFallback = false;
   if (sample && lim && lim.images) {
     try { const data = await sample.json('Read this grocery receipt photo. Today is ' + today() + '. ' + PARSE_SHAPE, { images: [blob], signal: sig, cache: false }); toReview(data, 'Receipt'); done = true; }
     catch (err) {
       const c = err && err.code;
       if (c === 'cancelled') done = true;
+      else if (canFallBack(err)) { busyFallback = true; addStatus = 'Gemini is busy. Reading on this device…'; setScanStatus(); }
       else if (!['not_granted', 'images_unavailable', 'sampling_disabled', 'not_declared'].includes(c)) { addErr = errCopy(err); done = true; }
     }
   }
   if (!done && !sig.aborted) {
-    try { toReview(await ocrReceipt(blob, sig), 'Receipt'); }
+    try { toReview(await ocrReceipt(blob, sig), 'Receipt'); if (busyFallback && ui.review) toast('Gemini was busy, so this was read on your phone. Check the items.'); }
     catch (err) { if (!sig.aborted) addErr = 'Couldn’t read that photo (' + ((err && err.message) || 'unknown error') + '). Try a flatter, well-lit shot, or add items by hand.'; }
   }
   addBusy = false; addStatus = ''; renderAdd();
@@ -899,7 +909,10 @@ async function importOrder() {
   try {
     const data = await sample.json('This is text copied from an online grocery order confirmation or order page. Today is ' + today() + '. ' + PARSE_SHAPE + '\n\nORDER TEXT:\n' + text.slice(0, 15000), { signal: addCtl.signal, modelTier: 'quick', cache: false });
     toReview(data, 'Online order'); window.__orderDraft = '';
-  } catch (err) { if (err && err.code !== 'cancelled') addErr = errCopy(err); }
+  } catch (err) {
+    if (canFallBack(err)) { toReview(parseReceiptText(text), 'Online order'); if (ui.review) { window.__orderDraft = ''; toast('Gemini was busy, so the order was read on your phone. Check the items.'); } }
+    else if (err && err.code !== 'cancelled') addErr = errCopy(err);
+  }
   addBusy = false; renderAdd();
 }
 function toReview(data, source) {
@@ -1009,7 +1022,9 @@ async function suggestMeals() {
     '\nWrite each recipe for a home cook who wants exact, followable instructions: say how much of each ingredient to use and how to cut or prepare it, the pan or tool, the heat level (low, medium, medium-high, high), how long each stage takes, and how to tell it is done by sight, sound, smell or texture. Steps must never mention an ingredient that is not listed or allowed. Keep each step to one or two sentences and give 6 to 12 steps.' +
     '\nReply with only JSON: {"meals":[{"name":"...","kind":"Breakfast|Lunch|Dinner|Side|Snack","serves":integer,"prepMinutes":integer,"cookMinutes":integer,"uses":["id",...],"amounts":{"id":"how much to use and how to prep it, e.g. all 600 g, cut into 3 cm pieces"},"extras":["each basic used, by name"],"extraAmounts":["e.g. 1 tbsp cooking oil"],"equipment":["e.g. large frying pan"],"steps":[{"title":"2-4 word step name","text":"what to do, with heat and timing","minutes":integer or null,"doneWhen":"how to tell it is ready, or null"}],"tip":"one line on serving, swaps within the listed items, or storing leftovers"}]}';
   try {
-    const data = sample ? await sample.json(prompt, { signal: mealsCtl.signal, cache: false }) : demoMeals(uf, ui.basics);
+    let data = null, demo = !sample;
+    if (sample) { try { data = await sample.json(prompt, { signal: mealsCtl.signal, cache: false }); } catch (err) { if (!canFallBack(err)) throw err; demo = true; } }
+    if (demo) data = demoMeals(uf, ui.basics);
     const ids = new Set(uf.map(i => i.id)); let dropped = 0;
     const meals = (data && Array.isArray(data.meals) ? data.meals : []).map((m, k) => {
       const uses = [...new Set((Array.isArray(m.uses) ? m.uses : []).filter(id => ids.has(id)))];
@@ -1025,7 +1040,7 @@ async function suggestMeals() {
     }).filter(Boolean);
     ui.meals = meals;
     ui.mealsNote = dropped ? dropped + (dropped === 1 ? ' idea was' : ' ideas were') + ' left out because ' + (dropped === 1 ? 'it' : 'they') + ' needed ingredients you don’t have marked use-first.' : '';
-    if (!sample) ui.mealsNote = 'Demo mode: simple template recipes.' + (ui.mealsNote ? ' ' + ui.mealsNote : '');
+    if (demo) ui.mealsNote = (sample ? 'Gemini is busy right now, so these are simple template recipes. Try again in a minute for better ideas.' : 'Demo mode: simple template recipes.') + (ui.mealsNote ? ' ' + ui.mealsNote : '');
     if (!meals.length) mealsErr = 'No meal could be made from only these items. Try allowing basics, or flag a few more items to use first.';
   } catch (err) { if (err && err.code !== 'cancelled') mealsErr = errCopy(err); }
   mealsBusy = false; renderMeals();
@@ -1159,7 +1174,11 @@ async function transcribe(blob) {
     const d = await sample.json('Transcribe this short spoken note about kitchen groceries, word for word. Reply with only JSON {"text":"..."}; use "" if nobody spoke.', { audio: blob, signal: vCtl.signal });
     const t = String((d && d.text) || '').trim();
     if (t) process(t); else vMode('empty', { msg: 'Didn’t catch that. Name the item, like “threw out the yogurt”.' });
-  } catch (err) { if (err && err.code === 'cancelled') vMode('typing'); else vMode('error', { msg: errCopy(err), err: true }); }
+  } catch (err) {
+    if (err && err.code === 'cancelled') vMode('typing');
+    else if (canFallBack(err)) vMode('typing', { msg: 'Gemini is busy right now, so your voice couldn’t be turned into text. Type it below instead.' });
+    else vMode('error', { msg: errCopy(err), err: true });
+  }
 }
 function voiceCleanup() { abortRec(); clearInterval(countdown); if (vCtl) vCtl.abort(); }
 
@@ -1194,7 +1213,7 @@ async function process(text) {
       '{"op":"shopping","name":"..."} ran out or needs buying\n{"op":"flag","id":"..."} speaker wants it used first\n' +
       'Match spoken names to inventory ids loosely. If something ran out, also add a shopping change. Ignore anything that is not a kitchen change.';
     try { const d = await sample.json(prompt, { signal: vCtl.signal, modelTier: 'quick', cache: false }); changes = d && Array.isArray(d.changes) ? d.changes : []; }
-    catch (err) { if (err && err.code === 'cancelled') { vMode('typing'); $('#vs-input').value = text; return; } if (err && err.code === 'not_granted') changes = null; else { vMode('error', { msg: errCopy(err), err: true }); return; } }
+    catch (err) { if (err && err.code === 'cancelled') { vMode('typing'); $('#vs-input').value = text; return; } if ((err && err.code === 'not_granted') || canFallBack(err)) changes = null; else { vMode('error', { msg: errCopy(err), err: true }); return; } }
   }
   if (changes === null) changes = localParse(text);
   applyChanges(changes, text);

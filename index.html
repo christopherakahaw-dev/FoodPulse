@@ -291,7 +291,8 @@ function niceDate(s) { return new Date(s + 'T12:00:00').toLocaleDateString(undef
 /* ---------- state ---------- */
 const KEY = 'foodpulse:v1';
 let S = { items: [], log: [], shopping: [], updatedAt: 0 };
-try { const raw = localStorage.getItem(KEY); if (raw) S = Object.assign(S, JSON.parse(raw)); } catch (e) {}
+let firstVisit = false;
+try { const raw = localStorage.getItem(KEY); if (raw) S = Object.assign(S, JSON.parse(raw)); else firstVisit = true; } catch (e) {}
 let ui = { tab: 0, view: 'expiry', meals: null, mealsNote: '', basics: true, review: null, flash: new Set(), access: null, photo: null };
 let dbRef = null, dbTimer = null;
 
@@ -633,6 +634,8 @@ function renderPantry() {
       groupHTML('Flagged to use first', flagged) + groupHTML('This week', g.week) + groupHTML('Later', g.later);
     if (!items.length) h += '<p class="note">Nothing in the ' + esc(ui.view) + '.</p>';
   }
+  const nDemo = S.items.filter(i => i.demo).length;
+  if (nDemo) h += '<div class="card" style="gap:8px"><b>' + nDemo + ' sample item' + (nDemo === 1 ? '' : 's') + ' to try things out</b><span class="note">Scan a receipt or hold the mic to add your own. Clear the samples whenever you’re ready.</span><button class="btn block" id="clear-demo">Clear sample items</button></div>';
   el.innerHTML = h + statsHTML() + shoppingHTML() + shareCardHTML();
   bindPantry();
   const amt = $('#risk-amt');
@@ -667,16 +670,17 @@ function bindPantry() {
   const a = $('#add-item'); if (a) a.onclick = () => openItem(null);
   const g = $('#go-add'); if (g) g.onclick = () => goTab(1);
   const c = $('#cook-cta'); if (c) c.onclick = () => goTab(2);
-  const s = $('#load-sample'); if (s) s.onclick = loadSample;
+  const s = $('#load-sample'); if (s) s.onclick = () => loadSample();
+  const cd = $('#clear-demo'); if (cd) cd.onclick = () => { const snap = snapshot(); S.items = S.items.filter(i => !i.demo); save(); renderAll(); toast('Sample items cleared', snap); };
   const so = $('#share-open'); if (so) so.onclick = openShare;
 }
-function loadSample() {
-  const mk = (name, qty, location, price, days) => Object.assign(newItem({ name, qty, location, price }), { expires: addDays(days) });
+function loadSample(quiet) {
+  const mk = (name, qty, location, price, days) => Object.assign(newItem({ name, qty, location, price }), { expires: addDays(days), demo: true });
   S.items = [mk('Chicken thighs', '600 g', 'fridge', 9.8, 0), mk('Baby spinach', 'opened bag', 'fridge', 4.2, 0), mk('Greek yogurt', '500 g', 'fridge', 5.6, 1),
     mk('Coriander', '1 bunch', 'fridge', 1.5, 1), mk('Button mushrooms', '250 g', 'fridge', 3.9, 2), mk('Red capsicum', 'half', 'fridge', 1.4, 2),
     mk('Eggs', '6', 'fridge', 3.2, 5), mk('Cheddar', '200 g', 'fridge', 6.5, 6), mk('Jasmine rice', '1 kg', 'pantry', 4.8, 300), mk('Frozen peas', '500 g', 'freezer', 2.9, 120)];
   S.items.forEach(i => ui.flash.add(i.id));
-  save(); renderAll(); toast('Sample kitchen loaded');
+  save(); renderAll(); if (!quiet) toast('Sample kitchen loaded');
 }
 
 /* ---------- ITEM SHEET ---------- */
@@ -1428,7 +1432,7 @@ function bindMarket() {
 /* ---------- render ---------- */
 function render(n) { if (n === 0) renderPantry(); else if (n === 1) renderAdd(); else if (n === 2) renderMeals(); else renderMarket(); }
 function renderAll() { renderPantry(); renderAdd(); renderMeals(); }
-renderAll();
+if (firstVisit && !S.items.length) loadSample(true); else renderAll();
 refreshAccess();
 
 /* ---------- account sync ---------- */

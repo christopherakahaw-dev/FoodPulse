@@ -345,6 +345,14 @@ try { Object.assign(G, JSON.parse(localStorage.getItem(GKEY) || '{}')); } catch 
 function saveG() { try { if (G.key) localStorage.setItem(GKEY, JSON.stringify(G)); else localStorage.removeItem(GKEY); } catch (e) {} }
 const GAPI = 'https://generativelanguage.googleapis.com/v1beta/';
 const GEMINI_PREFS = ['gemini-flash-latest', 'gemini-3.5-flash', 'gemini-3-flash', 'gemini-2.5-flash', 'gemini-flash-lite-latest', 'gemini-3.1-flash-lite', 'gemini-2.5-flash-lite'];
+// When hosted on Vercel with GEMINI_API_KEY set, /api/gemini holds the key server-side.
+let GS = null, gsChecked = null;
+function detectServer() {
+  if (!gsChecked) gsChecked = (/^https?:$/.test(location.protocol) ? fetch('api/gemini', { cache: 'no-store' }).then(r => r.ok ? r.json() : null).catch(() => null) : Promise.resolve(null))
+    .then(j => { GS = j && j.configured ? { model: j.model || '' } : null; return GS; });
+  return gsChecked;
+}
+const geminiOn = () => !!(G.key || GS);
 function gErr(code, message) { const e = new Error(message || code); e.code = code; return e; }
 async function gFetch(path, init, signal) {
   let r;
@@ -356,6 +364,21 @@ async function gFetch(path, init, signal) {
     if (r.status === 429) throw gErr('rate_limited', msg);
     if (/api key/i.test(msg) || r.status === 401 || st === 'PERMISSION_DENIED' || st === 'UNAUTHENTICATED') throw gErr('bad_key', msg);
     if (r.status === 404) throw gErr('model_missing', msg);
+    throw gErr('gemini_error', msg);
+  }
+  return j;
+}
+async function serverFetch(body, signal) {
+  let r;
+  try { r = await fetch('api/gemini', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal }); }
+  catch (e) { throw gErr(e && e.name === 'AbortError' ? 'cancelled' : 'offline'); }
+  const j = await r.json().catch(() => null);
+  if (!r.ok) {
+    const msg = (j && j.error && j.error.message) || ('HTTP ' + r.status), st = j && j.error && j.error.status;
+    if (r.status === 429) throw gErr('rate_limited', msg);
+    if (st === 'NOT_CONFIGURED') throw gErr('server_unset', msg);
+    if (/api key/i.test(msg) || st === 'PERMISSION_DENIED' || st === 'UNAUTHENTICATED') throw gErr('server_key', msg);
+    if (r.status === 413) throw gErr('prompt_too_large', msg);
     throw gErr('gemini_error', msg);
   }
   return j;
@@ -381,11 +404,12 @@ function geminiSample() {
     const parts = [{ text: typeof prompt === 'string' ? prompt : prompt.map(m => m.content).join('\n\n') }];
     for (const b of opts.images || []) parts.push({ inline_data: { mime_type: b.type || 'image/jpeg', data: await blobB64(b) } });
     if (opts.audio) parts.push({ inline_data: { mime_type: (opts.audio.type || 'audio/webm').split(';')[0], data: await blobB64(opts.audio) } });
-    if (!G.model) { G.model = await pickGeminiModel(); saveG(); }
+    const viaServer = !G.key;
+    if (!viaServer && !G.model) { G.model = await pickGeminiModel(); saveG(); }
     const body = { contents: [{ role: 'user', parts }], generationConfig: Object.assign({ temperature: .4 }, json ? { responseMimeType: 'application/json' } : {}) };
     let j;
-    try { j = await gFetch('models/' + G.model + ':generateContent', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, opts.signal); }
-    catch (e) { if (e.code === 'model_missing' && !retried) { G.model = ''; return gen(prompt, opts, json, true); } throw e; }
+    try { j = viaServer ? await serverFetch(body, opts.signal) : await gFetch('models/' + G.model + ':generateContent', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, opts.signal); }
+    catch (e) { if (e.code === 'model_missing' && !retried && !viaServer) { G.model = ''; return gen(prompt, opts, json, true); } throw e; }
     if (j && j.promptFeedback && j.promptFeedback.blockReason) throw gErr(opts.images ? 'image_rejected' : 'gemini_error', 'Gemini blocked the request (' + j.promptFeedback.blockReason + ')');
     const c = j && j.candidates && j.candidates[0];
     const text = c && c.content && c.content.parts ? c.content.parts.map(p => p.text || '').join('') : '';
@@ -400,7 +424,7 @@ function geminiSample() {
 }
 let samplePromise = null;
 function getSample() {
-  if (!samplePromise) samplePromise = G.key ? Promise.resolve(geminiSample())
+  if (!samplePromise) samplePromise = geminiOn() ? Promise.resolve(geminiSample())
     : (window.claude && window.claude.use) ? window.claude.use('sample').catch(() => null) : Promise.resolve(null);
   return samplePromise;
 }
@@ -408,6 +432,8 @@ function errCopy(e) {
   const c = e && e.code;
   if (c === 'not_granted') setTimeout(refreshAccess, 0);
   if (c === 'not_granted') return 'Claude access was declined for this page. Reload the page to allow it.';
+  if (c === 'server_key') return 'The server’s Gemini key was rejected. Check GEMINI_API_KEY in Vercel → Settings → Environment Variables, then redeploy.';
+  if (c === 'server_unset') return 'GEMINI_API_KEY isn’t set on the server. Add it in Vercel → Settings → Environment Variables, then redeploy.';
   if (c === 'bad_key') return 'Gemini didn’t accept your API key. Check it in Settings.';
   if (c === 'offline') return 'Couldn’t reach Gemini. Check your internet connection and try again.';
   if (c === 'model_missing') return 'No usable Gemini model was found for your key. Open Settings and test the key again.';
@@ -425,7 +451,8 @@ function errCopy(e) {
 /* ---------- which engine is on ---------- */
 let permsNS = null;
 async function refreshAccess() {
-  if (G.key) { ui.access = 'granted'; ui.photo = true; ui.engine = 'gemini'; render(ui.tab); return; }
+  await detectServer();
+  if (geminiOn()) { samplePromise = null; ui.access = 'granted'; ui.photo = true; ui.engine = 'gemini'; render(ui.tab); return; }
   try {
     if (!window.claude || !window.claude.use) { ui.access = 'unavailable'; ui.photo = false; }
     else {
@@ -471,16 +498,17 @@ function bindAccess(root) {
 /* ---------- settings: Gemini key and demo mode ---------- */
 function openSettings() {
   const sh = $('#item');
-  const status = G.key ? 'Connected to Gemini' + (G.model ? ' (' + esc(G.model) + ')' : '') + '. Receipts, order import, voice and meal ideas use your key.'
+  const status = G.key ? 'Connected to Gemini with the key saved in this browser' + (G.model ? ' (' + esc(G.model) + ')' : '') + '. Receipts, order import, voice and meal ideas use it.'
+    : GS ? 'Connected to Gemini through this site’s server' + (GS.model ? ' (' + esc(GS.model) + ')' : '') + '. Nothing to set up on this device. You can still paste your own key below to use it instead.'
     : ui.engine === 'claude' ? 'Using Claude, because this page is open inside claude.ai. Add a Gemini key to use Gemini instead.'
     : 'Demo mode. Everything works on this device without an account, with simpler results.';
   sh.innerHTML = '<div class="grab"></div><div class="head" style="align-items:center"><h2>AI and demo mode</h2>' +
     '<button class="icon-btn" id="st-close" aria-label="Close"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>' +
-    '<div class="card" style="gap:6px"><b>' + (G.key ? 'Gemini is on' : ui.engine === 'claude' ? 'Claude is on' : 'Demo mode is on') + '</b><span class="note">' + status + '</span></div>' +
+    '<div class="card" style="gap:6px"><b>' + (geminiOn() ? 'Gemini is on' : ui.engine === 'claude' ? 'Claude is on' : 'Demo mode is on') + '</b><span class="note">' + status + '</span></div>' +
     '<label class="field">Gemini API key<input id="g-key" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your key" value="' + esc(G.key) + '"></label>' +
     '<p class="note" style="margin:0">Get a free key at <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>. It’s saved only in this browser and sent only to Google. For safety, restrict the key to this website in Google Cloud’s credentials page.</p>' +
     '<button class="btn primary block" id="g-save">Save and test</button>' +
-    (G.key ? '<button class="btn block" id="g-remove">Remove key and use demo mode</button>' : '') +
+    (G.key ? '<button class="btn block" id="g-remove">' + (GS ? 'Remove my key and use the site’s server' : 'Remove key and use demo mode') + '</button>' : '') +
     (S.items.length ? '' : '<button class="btn block" id="st-sample">Load a sample kitchen to try it out</button>') +
     '<p class="note" id="g-msg" aria-live="polite" style="margin:0"></p>';
   const msg = t => { $('#g-msg').textContent = t; };
@@ -1097,7 +1125,7 @@ function startListening(retried) {
   transcript = ''; finishing = false; recAborted = false;
   $('#vs-text').textContent = 'Say what changed, like “used the spinach and two eggs”'; $('#vs-text').classList.add('placeholder');
   if (!SR) {
-    if (G.key && window.MediaRecorder && navigator.mediaDevices && window.isSecureContext) { startRecording(); return; }
+    if (geminiOn() && window.MediaRecorder && navigator.mediaDevices && window.isSecureContext) { startRecording(); return; }
     vMode('typing', { msg: 'This browser can’t turn speech into text by itself (try Chrome, Edge or Safari, or connect Gemini in Settings). Type below, or tap the mic on your phone’s keyboard to dictate.' }); return;
   }
   let r;

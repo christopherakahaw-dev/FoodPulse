@@ -338,16 +338,80 @@ function newItem(o) {
     useFirst: false, addedAt: Date.now(), cat: CATS[o.category] ? o.category : classify(o.name, loc) };
 }
 
-/* ---------- Claude ---------- */
+/* ---------- AI engine: Gemini (your key) → Claude (inside claude.ai) → demo mode ---------- */
+const GKEY = 'foodpulse:gemini';
+let G = { key: '', model: '' };
+try { Object.assign(G, JSON.parse(localStorage.getItem(GKEY) || '{}')); } catch (e) {}
+function saveG() { try { if (G.key) localStorage.setItem(GKEY, JSON.stringify(G)); else localStorage.removeItem(GKEY); } catch (e) {} }
+const GAPI = 'https://generativelanguage.googleapis.com/v1beta/';
+const GEMINI_PREFS = ['gemini-flash-latest', 'gemini-3.5-flash', 'gemini-3-flash', 'gemini-2.5-flash', 'gemini-flash-lite-latest', 'gemini-3.1-flash-lite', 'gemini-2.5-flash-lite'];
+function gErr(code, message) { const e = new Error(message || code); e.code = code; return e; }
+async function gFetch(path, init, signal) {
+  let r;
+  try { r = await fetch(GAPI + path, Object.assign({}, init, { signal, headers: Object.assign({ 'x-goog-api-key': G.key }, init && init.headers) })); }
+  catch (e) { throw gErr(e && e.name === 'AbortError' ? 'cancelled' : 'offline'); }
+  const j = await r.json().catch(() => null);
+  if (!r.ok) {
+    const msg = (j && j.error && j.error.message) || ('HTTP ' + r.status), st = j && j.error && j.error.status;
+    if (r.status === 429) throw gErr('rate_limited', msg);
+    if (/api key/i.test(msg) || r.status === 401 || st === 'PERMISSION_DENIED' || st === 'UNAUTHENTICATED') throw gErr('bad_key', msg);
+    if (r.status === 404) throw gErr('model_missing', msg);
+    throw gErr('gemini_error', msg);
+  }
+  return j;
+}
+async function pickGeminiModel() {
+  const j = await gFetch('models?pageSize=1000');
+  const names = ((j && j.models) || []).filter(m => (m.supportedGenerationMethods || []).includes('generateContent')).map(m => String(m.name).replace(/^models\//, ''));
+  if (!names.length) throw gErr('model_missing', 'No text models are available for this key.');
+  return GEMINI_PREFS.find(n => names.includes(n)) ||
+    names.find(n => /flash/.test(n) && !/image|tts|live|audio|embed|preview|exp/.test(n)) ||
+    names.find(n => /gemini/.test(n) && !/image|tts|live|audio|embed/.test(n)) || names[0];
+}
+const blobB64 = b => new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(String(fr.result).split(',')[1]); fr.onerror = rej; fr.readAsDataURL(b); });
+function parseJSONText(t) {
+  const s = String(t || '').replace(/^\s*```(?:json)?/i, '').replace(/```\s*$/, '').trim();
+  try { return JSON.parse(s); } catch (e) {}
+  const m = s.match(/[[{][\s\S]*[\]}]/); if (m) { try { return JSON.parse(m[0]); } catch (e) {} }
+  throw gErr('invalid_json');
+}
+function geminiSample() {
+  async function gen(prompt, opts, json, retried) {
+    opts = opts || {};
+    const parts = [{ text: typeof prompt === 'string' ? prompt : prompt.map(m => m.content).join('\n\n') }];
+    for (const b of opts.images || []) parts.push({ inline_data: { mime_type: b.type || 'image/jpeg', data: await blobB64(b) } });
+    if (opts.audio) parts.push({ inline_data: { mime_type: (opts.audio.type || 'audio/webm').split(';')[0], data: await blobB64(opts.audio) } });
+    if (!G.model) { G.model = await pickGeminiModel(); saveG(); }
+    const body = { contents: [{ role: 'user', parts }], generationConfig: Object.assign({ temperature: .4 }, json ? { responseMimeType: 'application/json' } : {}) };
+    let j;
+    try { j = await gFetch('models/' + G.model + ':generateContent', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, opts.signal); }
+    catch (e) { if (e.code === 'model_missing' && !retried) { G.model = ''; return gen(prompt, opts, json, true); } throw e; }
+    if (j && j.promptFeedback && j.promptFeedback.blockReason) throw gErr(opts.images ? 'image_rejected' : 'gemini_error', 'Gemini blocked the request (' + j.promptFeedback.blockReason + ')');
+    const c = j && j.candidates && j.candidates[0];
+    const text = c && c.content && c.content.parts ? c.content.parts.map(p => p.text || '').join('') : '';
+    if (!text) throw gErr('gemini_error', 'Gemini sent an empty answer' + (c && c.finishReason ? ' (' + c.finishReason + ')' : ''));
+    return text;
+  }
+  const s = async (input, opts) => ({ text: await gen(input, opts, false), truncated: false });
+  s.json = async (input, opts) => parseJSONText(await gen(input, opts, true));
+  s.limits = async () => ({ images: true, audio: true });
+  s.engine = 'gemini';
+  return s;
+}
 let samplePromise = null;
 function getSample() {
-  if (!samplePromise) samplePromise = (window.claude && window.claude.use) ? window.claude.use('sample').catch(() => null) : Promise.resolve(null);
+  if (!samplePromise) samplePromise = G.key ? Promise.resolve(geminiSample())
+    : (window.claude && window.claude.use) ? window.claude.use('sample').catch(() => null) : Promise.resolve(null);
   return samplePromise;
 }
 function errCopy(e) {
   const c = e && e.code;
   if (c === 'not_granted') setTimeout(refreshAccess, 0);
   if (c === 'not_granted') return 'Claude access was declined for this page. Reload the page to allow it.';
+  if (c === 'bad_key') return 'Gemini didn’t accept your API key. Check it in Settings.';
+  if (c === 'offline') return 'Couldn’t reach Gemini. Check your internet connection and try again.';
+  if (c === 'model_missing') return 'No usable Gemini model was found for your key. Open Settings and test the key again.';
+  if (c === 'gemini_error') return 'Gemini couldn’t answer: ' + ((e && e.message) || 'unknown error') + '.';
   if (c === 'rate_limited') return 'Too many requests at once. Wait a moment and try again.';
   if (c === 'image_rejected') return 'That photo couldn’t be read. Try a clearer, well-lit shot of the whole receipt.';
   if (c === 'images_unavailable') return 'Photo reading isn’t available here. Import the order text or add items by hand.';
@@ -358,9 +422,10 @@ function errCopy(e) {
   return 'Something went wrong' + (c ? ' (' + c + ')' : '') + '. Try again.';
 }
 
-/* ---------- access to Claude features ---------- */
+/* ---------- which engine is on ---------- */
 let permsNS = null;
 async function refreshAccess() {
+  if (G.key) { ui.access = 'granted'; ui.photo = true; ui.engine = 'gemini'; render(ui.tab); return; }
   try {
     if (!window.claude || !window.claude.use) { ui.access = 'unavailable'; ui.photo = false; }
     else {
@@ -371,15 +436,17 @@ async function refreshAccess() {
       else { const lim = await sample.limits().catch(() => null); ui.photo = !!(lim && lim.images); }
     }
   } catch (e) { ui.access = 'unavailable'; ui.photo = false; }
+  ui.engine = ui.access === 'unavailable' ? 'demo' : 'claude';
   render(ui.tab);
 }
+const isDemo = () => ui.engine === 'demo';
 function accessBanner() {
   const a = ui.access;
   if (!a || a === 'granted') return '';
   const copy = {
     prompt: ['Turn on receipt reading and meal ideas', 'These use Claude on your account. Allow it once and they work from then on.', 'Turn on'],
     denied: ['Receipt reading and meal ideas are switched off', 'Claude access was declined for this page. Switch it back on in Permissions.', 'Open permissions'],
-    unavailable: ['Receipt reading and meal ideas aren’t available here', 'Open Food Pulse from claude.ai, signed in, to use them.', '']
+    unavailable: ['You’re in demo mode', 'Receipts are read on this device, voice uses simple word matching, and meal ideas come from basic templates. Connect a free Gemini API key for the full AI.', 'Connect Gemini']
   }[a] || null;
   if (!copy) return '';
   return '<div class="card" style="border-color:var(--urgent)"><h2 style="font-size:17px">' + copy[0] + '</h2><p class="note" style="margin:0">' + copy[1] + '</p>' +
@@ -388,7 +455,7 @@ function accessBanner() {
 function bindAccess(root) {
   const b = root.querySelector('[data-access]'); if (!b) return;
   b.onclick = async () => {
-    if (!permsNS) return;
+    if (ui.access === 'unavailable' || !permsNS) { openSettings(); return; }
     b.disabled = true;
     try {
       if (ui.access === 'denied') await permsNS.manage();
@@ -399,6 +466,64 @@ function bindAccess(root) {
     }
     b.disabled = false; refreshAccess();
   };
+}
+
+/* ---------- settings: Gemini key and demo mode ---------- */
+function openSettings() {
+  const sh = $('#item');
+  const status = G.key ? 'Connected to Gemini' + (G.model ? ' (' + esc(G.model) + ')' : '') + '. Receipts, order import, voice and meal ideas use your key.'
+    : ui.engine === 'claude' ? 'Using Claude, because this page is open inside claude.ai. Add a Gemini key to use Gemini instead.'
+    : 'Demo mode. Everything works on this device without an account, with simpler results.';
+  sh.innerHTML = '<div class="grab"></div><div class="head" style="align-items:center"><h2>AI and demo mode</h2>' +
+    '<button class="icon-btn" id="st-close" aria-label="Close"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>' +
+    '<div class="card" style="gap:6px"><b>' + (G.key ? 'Gemini is on' : ui.engine === 'claude' ? 'Claude is on' : 'Demo mode is on') + '</b><span class="note">' + status + '</span></div>' +
+    '<label class="field">Gemini API key<input id="g-key" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your key" value="' + esc(G.key) + '"></label>' +
+    '<p class="note" style="margin:0">Get a free key at <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>. It’s saved only in this browser and sent only to Google. For safety, restrict the key to this website in Google Cloud’s credentials page.</p>' +
+    '<button class="btn primary block" id="g-save">Save and test</button>' +
+    (G.key ? '<button class="btn block" id="g-remove">Remove key and use demo mode</button>' : '') +
+    (S.items.length ? '' : '<button class="btn block" id="st-sample">Load a sample kitchen to try it out</button>') +
+    '<p class="note" id="g-msg" aria-live="polite" style="margin:0"></p>';
+  const msg = t => { $('#g-msg').textContent = t; };
+  $('#st-close').onclick = hideSheet;
+  $('#g-save').onclick = async () => {
+    const k = $('#g-key').value.trim(); if (!k) { msg('Paste a key first.'); $('#g-key').focus(); return; }
+    const old = Object.assign({}, G); G.key = k; G.model = '';
+    $('#g-save').disabled = true; msg('Testing your key…');
+    try { G.model = await pickGeminiModel(); saveG(); samplePromise = null; await refreshAccess(); openSettings(); msg('Connected. Using ' + G.model + '.'); }
+    catch (e) { G = old; msg(errCopy(e)); $('#g-save').disabled = false; }
+  };
+  const rm = $('#g-remove'); if (rm) rm.onclick = async () => { G = { key: '', model: '' }; saveG(); samplePromise = null; await refreshAccess(); openSettings(); };
+  const sp = $('#st-sample'); if (sp) sp.onclick = () => { hideSheet(); loadSample(); };
+  if (!openSheet) showSheet(sh);
+}
+
+/* ---------- demo-mode meal ideas (no AI) ---------- */
+function demoMeals(uf, basics) {
+  const pool = uf.slice(0, 9), meals = [];
+  while (pool.length && meals.length < 3) {
+    const take = pool.splice(0, Math.min(3, pool.length)), cat = i => catOf(i);
+    const meat = take.filter(i => cat(i) === 'meat'), eggs = take.filter(i => /egg/i.test(i.name)), veg = take.filter(i => cat(i) === 'produce');
+    const tops = take.filter(i => cat(i) === 'dairy' && !eggs.includes(i));
+    const other = take.filter(i => !meat.includes(i) && !eggs.includes(i) && !veg.includes(i) && !tops.includes(i));
+    const list = take.map(i => i.name.toLowerCase());
+    const joined = list.length > 1 ? list.slice(0, -1).join(', ') + ' and ' + list[list.length - 1] : list[0];
+    const kind = meat.length ? 'Dinner' : eggs.length ? 'Breakfast' : 'Lunch';
+    const name = (eggs.length && !meat.length ? 'Soft scramble with ' : meat.length ? 'Pan-fried ' : 'Quick sauté of ') + joined;
+    const steps = [], amounts = {};
+    take.forEach(i => { amounts[i.id] = 'all ' + (i.qty || 'of it') + (cat(i) === 'produce' || cat(i) === 'meat' ? ', cut into bite-size pieces' : ''); });
+    steps.push({ title: 'Prep', text: 'Wash any fruit or veg. Cut ' + joined + ' into even bite-size pieces so they cook at the same rate.', minutes: 5, doneWhen: '' });
+    steps.push({ title: 'Heat the pan', text: basics ? 'Put a large frying pan over medium-high heat and add 1 tablespoon of cooking oil.' : 'Put a large non-stick frying pan over medium-high heat, dry.', minutes: 1, doneWhen: basics ? 'The oil shimmers.' : 'A drop of water sizzles on contact.' });
+    if (meat.length) steps.push({ title: 'Cook the ' + meat.map(i => i.name.toLowerCase()).join(' and '), text: 'Add the meat in one layer and leave it 3 minutes, then turn and cook 3 to 5 minutes more.', minutes: 8, doneWhen: 'No pink remains in the middle (75°C inside).' });
+    if (veg.length) steps.push({ title: 'Add the ' + veg.map(i => i.name.toLowerCase()).join(' and '), text: 'Add the veg and stir every 30 seconds.', minutes: 4, doneWhen: 'Tender, bright and just starting to brown at the edges.' });
+    if (other.length) steps.push({ title: 'Add the rest', text: 'Stir in the ' + other.map(i => i.name.toLowerCase()).join(' and ') + ' and warm through.', minutes: 2, doneWhen: 'Hot all the way through.' });
+    if (eggs.length) steps.push({ title: 'Eggs', text: 'Turn the heat to medium-low. Beat the eggs, pour them in and stir slowly with a spatula.', minutes: 2, doneWhen: 'Just set but still glossy.' });
+    steps.push({ title: 'Serve', text: (basics ? 'Season with salt and pepper, ' : '') + 'taste, and serve straight away' + (tops.length ? ', topped with the ' + tops.map(i => i.name.toLowerCase()).join(' and ') : '') + '.', minutes: null, doneWhen: '' });
+    const cookM = steps.reduce((a, s) => a + (s.minutes || 0), 0) - 5;
+    meals.push({ name: name.charAt(0).toUpperCase() + name.slice(1), kind, serves: 2, prepMinutes: 5, cookMinutes: Math.max(3, cookM), uses: take.map(i => i.id), amounts,
+      extras: basics ? ['salt', 'pepper', 'cooking oil'] : [], extraAmounts: basics ? ['1 tbsp cooking oil', 'salt and pepper to taste'] : [], equipment: ['Large frying pan', 'Spatula', 'Knife and board'], steps,
+      tip: 'Demo recipe from a simple template. Connect Gemini in Settings for recipes written around your exact ingredients.' });
+  }
+  return { meals };
 }
 
 /* ---------- toast ---------- */
@@ -475,8 +600,9 @@ let lastRisk = null;
 function renderPantry() {
   const el = $('#s-pantry');
   const dateStr = new Date().toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'short' });
-  let h = '<div class="head"><div><div class="sub">' + esc(dateStr) + '</div><h1>Your kitchen</h1></div>' +
-    '<button class="icon-btn" id="add-item" aria-label="Add an item by hand"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></button></div>';
+  let h = '<div class="head"><div><div class="sub">' + esc(dateStr) + (ui.engine ? ' · ' + (ui.engine === 'gemini' ? 'Gemini' : ui.engine === 'claude' ? 'Claude' : 'Demo mode') : '') + '</div><h1>Your kitchen</h1></div><div style="display:flex;gap:8px">' +
+    '<button class="icon-btn" id="open-settings" aria-label="AI and demo mode settings"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M2 12h3M19 12h3M4.9 19.1L7 17M17 7l2.1-2.1"/></svg></button>' +
+    '<button class="icon-btn" id="add-item" aria-label="Add an item by hand"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></button></div></div>';
 
   if (!S.items.length) {
     h += '<div class="card empty"><h2>Nothing tracked yet</h2><p>Scan a receipt, import an online order, or hold the mic and say what you bought.</p>' +
@@ -543,6 +669,7 @@ function bindPantry() {
     setTimeout(() => { S.shopping.splice(k, 1); save(); renderPantry(); toast('Ticked off ' + name); }, 250);
   }));
   const a = $('#add-item'); if (a) a.onclick = () => openItem(null);
+  const st = $('#open-settings'); if (st) st.onclick = openSettings;
   const g = $('#go-add'); if (g) g.onclick = () => goTab(1);
   const c = $('#cook-cta'); if (c) c.onclick = () => goTab(2);
   const s = $('#load-sample'); if (s) s.onclick = loadSample;
@@ -710,7 +837,7 @@ function loadTesseract() {
   return tessP;
 }
 function setScanStatus() { const e = document.querySelector('#s-add .scan-status'); if (e) e.textContent = addStatus; }
-const RECEIPT_SKIP = /(total|tax|gst|vat|change|cash|card|visa|master|amex|eftpos|debit|credit|balance|saving|discount|coupon|tender|due|rounding|points|reward|member|bag|deposit|tel|phone|abn|receipt|invoice|thank|approved|auth)/i;
+const RECEIPT_SKIP = /(total|tax|gst|vat|change|cash|card|visa|master|amex|eftpos|debit|credit|balance|saving|discount|coupon|tender|due|rounding|points|reward|member|bag|deposit|fee|delivery|shipping|service|tip|tel|phone|abn|receipt|invoice|thank|approved|auth)/i;
 const SHELF = { produce: 5, dairy: 10, meat: 3, bakery: 4, frozen: 90, pantry: 180, drinks: 30 };
 function parseReceiptText(text) {
   const lines = String(text).split(/\n/).map(l => l.replace(/\s+/g, ' ').trim()).filter(Boolean);
@@ -768,7 +895,7 @@ async function importOrder() {
   const text = ($('#order-text').value || '').trim();
   if (text.length < 10) { addErr = 'Paste the order text first.'; renderAdd(); return; }
   const sample = await getSample();
-  if (!sample) { addErr = 'Order import needs Claude, which isn’t available in this view. Open this page from claude.ai.'; renderAdd(); return; }
+  if (!sample) { toReview(parseReceiptText(text), 'Online order'); if (ui.review) window.__orderDraft = ''; renderAdd(); return; }
   addBusy = true; addErr = ''; renderAdd(); addCtl = new AbortController();
   try {
     const data = await sample.json('This is text copied from an online grocery order confirmation or order page. Today is ' + today() + '. ' + PARSE_SHAPE + '\n\nORDER TEXT:\n' + text.slice(0, 15000), { signal: addCtl.signal, modelTier: 'quick', cache: false });
@@ -875,7 +1002,6 @@ function toggleTimer(k, min, label) {
 function paintTimer(k, min) { const b = document.querySelector('[data-timer="' + k + '"]'); if (b) { b.textContent = timerLabel(k, min); b.classList.toggle('running', !!TIMERS[k]); } }
 async function suggestMeals() {
   const uf = useFirstItems(), sample = await getSample();
-  if (!sample) { mealsErr = 'Meal ideas need Claude, which isn’t available in this view. Open this page from claude.ai.'; renderMeals(); return; }
   mealsBusy = true; mealsErr = ''; renderMeals(); mealsCtl = new AbortController();
   const list = uf.map(i => ({ id: i.id, name: i.name, qty: i.qty, daysLeft: daysLeft(i.expires) }));
   const prompt = 'Suggest up to 3 simple home meals that use ONLY these ingredients, which need using first:\n' + JSON.stringify(list) + '\n\n' +
@@ -884,7 +1010,7 @@ async function suggestMeals() {
     '\nWrite each recipe for a home cook who wants exact, followable instructions: say how much of each ingredient to use and how to cut or prepare it, the pan or tool, the heat level (low, medium, medium-high, high), how long each stage takes, and how to tell it is done by sight, sound, smell or texture. Steps must never mention an ingredient that is not listed or allowed. Keep each step to one or two sentences and give 6 to 12 steps.' +
     '\nReply with only JSON: {"meals":[{"name":"...","kind":"Breakfast|Lunch|Dinner|Side|Snack","serves":integer,"prepMinutes":integer,"cookMinutes":integer,"uses":["id",...],"amounts":{"id":"how much to use and how to prep it, e.g. all 600 g, cut into 3 cm pieces"},"extras":["each basic used, by name"],"extraAmounts":["e.g. 1 tbsp cooking oil"],"equipment":["e.g. large frying pan"],"steps":[{"title":"2-4 word step name","text":"what to do, with heat and timing","minutes":integer or null,"doneWhen":"how to tell it is ready, or null"}],"tip":"one line on serving, swaps within the listed items, or storing leftovers"}]}';
   try {
-    const data = await sample.json(prompt, { signal: mealsCtl.signal, cache: false });
+    const data = sample ? await sample.json(prompt, { signal: mealsCtl.signal, cache: false }) : demoMeals(uf, ui.basics);
     const ids = new Set(uf.map(i => i.id)); let dropped = 0;
     const meals = (data && Array.isArray(data.meals) ? data.meals : []).map((m, k) => {
       const uses = [...new Set((Array.isArray(m.uses) ? m.uses : []).filter(id => ids.has(id)))];
@@ -900,6 +1026,7 @@ async function suggestMeals() {
     }).filter(Boolean);
     ui.meals = meals;
     ui.mealsNote = dropped ? dropped + (dropped === 1 ? ' idea was' : ' ideas were') + ' left out because ' + (dropped === 1 ? 'it' : 'they') + ' needed ingredients you don’t have marked use-first.' : '';
+    if (!sample) ui.mealsNote = 'Demo mode: simple template recipes. Connect Gemini in Settings for real ideas.' + (ui.mealsNote ? ' ' + ui.mealsNote : '');
     if (!meals.length) mealsErr = 'No meal could be made from only these items. Try allowing basics, or flag a few more items to use first.';
   } catch (err) { if (err && err.code !== 'cancelled') mealsErr = errCopy(err); }
   mealsBusy = false; renderMeals();
@@ -969,7 +1096,10 @@ function micBlockedMsg() {
 function startListening(retried) {
   transcript = ''; finishing = false; recAborted = false;
   $('#vs-text').textContent = 'Say what changed, like “used the spinach and two eggs”'; $('#vs-text').classList.add('placeholder');
-  if (!SR) { vMode('typing', { msg: 'This browser doesn’t support voice input (try Chrome, Edge or Safari). Type below, or tap the mic on your phone’s keyboard to dictate.' }); return; }
+  if (!SR) {
+    if (G.key && window.MediaRecorder && navigator.mediaDevices && window.isSecureContext) { startRecording(); return; }
+    vMode('typing', { msg: 'This browser can’t turn speech into text by itself (try Chrome, Edge or Safari, or connect Gemini in Settings). Type below, or tap the mic on your phone’s keyboard to dictate.' }); return;
+  }
   let r;
   try {
     r = rec = new SR(); r.lang = navigator.language || 'en-US'; r.interimResults = true; r.continuous = true;
@@ -1001,8 +1131,37 @@ function startListening(retried) {
     r.start(); vMode('listening');
   } catch (e) { rec = null; vMode('typing', { msg: micBlockedMsg() }); }
 }
-function stopListening() { if (rec) { finishing = true; try { rec.stop(); } catch (e) { rec = null; transcript ? process(transcript) : vMode('empty'); } } else if (transcript) process(transcript); }
-function abortRec() { finishing = false; recAborted = true; if (rec) { const r = rec; rec = null; try { r.abort(); } catch (e) {} } }
+function stopListening() { if (mr) { if (mr.state !== 'inactive') mr.stop(); return; } if (rec) { finishing = true; try { rec.stop(); } catch (e) { rec = null; transcript ? process(transcript) : vMode('empty'); } } else if (transcript) process(transcript); }
+function abortRec() { finishing = false; recAborted = true; if (mr && mr.state !== 'inactive') mr.stop(); if (rec) { const r = rec; rec = null; try { r.abort(); } catch (e) {} } }
+/* Recording + Gemini transcription, for browsers without SpeechRecognition */
+let mr = null;
+async function startRecording() {
+  let st;
+  try { st = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+  catch (e) { vMode('typing', { msg: e && e.name === 'NotFoundError' ? 'No microphone found. Type below instead.' : micBlockedMsg() }); return; }
+  if (!(openSheet && openSheet.id === 'voice') || recAborted) { st.getTracks().forEach(t => t.stop()); return; }
+  const type = ['audio/ogg;codecs=opus', 'audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'].find(t => MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t));
+  const r = mr = new MediaRecorder(st, type ? { mimeType: type } : undefined), chunks = [];
+  r.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+  r.onstop = () => {
+    st.getTracks().forEach(t => t.stop()); if (mr === r) mr = null;
+    if (recAborted) return;
+    const blob = new Blob(chunks, { type: r.mimeType || type || 'audio/webm' });
+    if (blob.size < 1500) { vMode('empty', { msg: 'Didn’t catch that. Hold the button and name the item, like “threw out the yogurt”.' }); return; }
+    transcribe(blob);
+  };
+  r.start(); vMode('listening');
+  $('#vs-text').textContent = 'Recording… say what changed'; $('#vs-text').classList.add('placeholder');
+}
+async function transcribe(blob) {
+  vMode('thinking'); $('#vs-text').textContent = 'Turning your voice into text…';
+  const sample = await getSample(); vCtl = new AbortController();
+  try {
+    const d = await sample.json('Transcribe this short spoken note about kitchen groceries, word for word. Reply with only JSON {"text":"..."}; use "" if nobody spoke.', { audio: blob, signal: vCtl.signal });
+    const t = String((d && d.text) || '').trim();
+    if (t) process(t); else vMode('empty', { msg: 'Didn’t catch that. Name the item, like “threw out the yogurt”.' });
+  } catch (err) { if (err && err.code === 'cancelled') vMode('typing'); else vMode('error', { msg: errCopy(err), err: true }); }
+}
 function voiceCleanup() { abortRec(); clearInterval(countdown); if (vCtl) vCtl.abort(); }
 
 const mic = $('#mic');
@@ -1014,8 +1173,8 @@ mic.addEventListener('pointerdown', e => {
 function micUp() {
   if (!holdStart) return; mic.classList.remove('holding');
   const held = Date.now() - holdStart; holdStart = 0;
-  if (held > 450 && rec) stopListening();
-  else { holdMode = false; if (rec) vMode('listening'); }
+  if (held > 450 && (rec || mr)) stopListening();
+  else { holdMode = false; if (rec || mr) vMode('listening'); }
 }
 mic.addEventListener('pointerup', micUp); mic.addEventListener('pointercancel', micUp);
 window.addEventListener('pointerup', micUp); window.addEventListener('pointercancel', micUp);

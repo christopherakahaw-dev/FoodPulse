@@ -434,9 +434,9 @@ function errCopy(e) {
   if (c === 'not_granted') return 'Claude access was declined for this page. Reload the page to allow it.';
   if (c === 'server_key') return 'The server’s Gemini key was rejected. Check GEMINI_API_KEY in Vercel → Settings → Environment Variables, then redeploy.';
   if (c === 'server_unset') return 'GEMINI_API_KEY isn’t set on the server. Add it in Vercel → Settings → Environment Variables, then redeploy.';
-  if (c === 'bad_key') return 'Gemini didn’t accept your API key. Check it in Settings.';
+  if (c === 'bad_key') return 'Gemini didn’t accept your API key. Check GEMINI_API_KEY in Vercel.';
   if (c === 'offline') return 'Couldn’t reach Gemini. Check your internet connection and try again.';
-  if (c === 'model_missing') return 'No usable Gemini model was found for your key. Open Settings and test the key again.';
+  if (c === 'model_missing') return 'No usable Gemini model was found for the key. Check GEMINI_MODEL in Vercel, or remove it so one is picked automatically.';
   if (c === 'gemini_error') return 'Gemini couldn’t answer: ' + ((e && e.message) || 'unknown error') + '.';
   if (c === 'rate_limited') return 'Too many requests at once. Wait a moment and try again.';
   if (c === 'image_rejected') return 'That photo couldn’t be read. Try a clearer, well-lit shot of the whole receipt.';
@@ -472,8 +472,7 @@ function accessBanner() {
   if (!a || a === 'granted') return '';
   const copy = {
     prompt: ['Turn on receipt reading and meal ideas', 'These use Claude on your account. Allow it once and they work from then on.', 'Turn on'],
-    denied: ['Receipt reading and meal ideas are switched off', 'Claude access was declined for this page. Switch it back on in Permissions.', 'Open permissions'],
-    unavailable: ['You’re in demo mode', 'Receipts are read on this device, voice uses simple word matching, and meal ideas come from basic templates. Connect a free Gemini API key for the full AI.', 'Connect Gemini']
+    denied: ['Receipt reading and meal ideas are switched off', 'Claude access was declined for this page. Switch it back on in Permissions.', 'Open permissions']
   }[a] || null;
   if (!copy) return '';
   return '<div class="card" style="border-color:var(--urgent)"><h2 style="font-size:17px">' + copy[0] + '</h2><p class="note" style="margin:0">' + copy[1] + '</p>' +
@@ -482,7 +481,7 @@ function accessBanner() {
 function bindAccess(root) {
   const b = root.querySelector('[data-access]'); if (!b) return;
   b.onclick = async () => {
-    if (ui.access === 'unavailable' || !permsNS) { openSettings(); return; }
+    if (!permsNS) return;
     b.disabled = true;
     try {
       if (ui.access === 'denied') await permsNS.manage();
@@ -493,36 +492,6 @@ function bindAccess(root) {
     }
     b.disabled = false; refreshAccess();
   };
-}
-
-/* ---------- settings: Gemini key and demo mode ---------- */
-function openSettings() {
-  const sh = $('#item');
-  const status = G.key ? 'Connected to Gemini with the key saved in this browser' + (G.model ? ' (' + esc(G.model) + ')' : '') + '. Receipts, order import, voice and meal ideas use it.'
-    : GS ? 'Connected to Gemini through this site’s server' + (GS.model ? ' (' + esc(GS.model) + ')' : '') + '. Nothing to set up on this device. You can still paste your own key below to use it instead.'
-    : ui.engine === 'claude' ? 'Using Claude, because this page is open inside claude.ai. Add a Gemini key to use Gemini instead.'
-    : 'Demo mode. Everything works on this device without an account, with simpler results.';
-  sh.innerHTML = '<div class="grab"></div><div class="head" style="align-items:center"><h2>AI and demo mode</h2>' +
-    '<button class="icon-btn" id="st-close" aria-label="Close"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>' +
-    '<div class="card" style="gap:6px"><b>' + (geminiOn() ? 'Gemini is on' : ui.engine === 'claude' ? 'Claude is on' : 'Demo mode is on') + '</b><span class="note">' + status + '</span></div>' +
-    '<label class="field">Gemini API key<input id="g-key" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your key" value="' + esc(G.key) + '"></label>' +
-    '<p class="note" style="margin:0">Get a free key at <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>. It’s saved only in this browser and sent only to Google. For safety, restrict the key to this website in Google Cloud’s credentials page.</p>' +
-    '<button class="btn primary block" id="g-save">Save and test</button>' +
-    (G.key ? '<button class="btn block" id="g-remove">' + (GS ? 'Remove my key and use the site’s server' : 'Remove key and use demo mode') + '</button>' : '') +
-    (S.items.length ? '' : '<button class="btn block" id="st-sample">Load a sample kitchen to try it out</button>') +
-    '<p class="note" id="g-msg" aria-live="polite" style="margin:0"></p>';
-  const msg = t => { $('#g-msg').textContent = t; };
-  $('#st-close').onclick = hideSheet;
-  $('#g-save').onclick = async () => {
-    const k = $('#g-key').value.trim(); if (!k) { msg('Paste a key first.'); $('#g-key').focus(); return; }
-    const old = Object.assign({}, G); G.key = k; G.model = '';
-    $('#g-save').disabled = true; msg('Testing your key…');
-    try { G.model = await pickGeminiModel(); saveG(); samplePromise = null; await refreshAccess(); openSettings(); msg('Connected. Using ' + G.model + '.'); }
-    catch (e) { G = old; msg(errCopy(e)); $('#g-save').disabled = false; }
-  };
-  const rm = $('#g-remove'); if (rm) rm.onclick = async () => { G = { key: '', model: '' }; saveG(); samplePromise = null; await refreshAccess(); openSettings(); };
-  const sp = $('#st-sample'); if (sp) sp.onclick = () => { hideSheet(); loadSample(); };
-  if (!openSheet) showSheet(sh);
 }
 
 /* ---------- demo-mode meal ideas (no AI) ---------- */
@@ -549,7 +518,7 @@ function demoMeals(uf, basics) {
     const cookM = steps.reduce((a, s) => a + (s.minutes || 0), 0) - 5;
     meals.push({ name: name.charAt(0).toUpperCase() + name.slice(1), kind, serves: 2, prepMinutes: 5, cookMinutes: Math.max(3, cookM), uses: take.map(i => i.id), amounts,
       extras: basics ? ['salt', 'pepper', 'cooking oil'] : [], extraAmounts: basics ? ['1 tbsp cooking oil', 'salt and pepper to taste'] : [], equipment: ['Large frying pan', 'Spatula', 'Knife and board'], steps,
-      tip: 'Demo recipe from a simple template. Connect Gemini in Settings for recipes written around your exact ingredients.' });
+      tip: 'Demo recipe from a simple template.' });
   }
   return { meals };
 }
@@ -629,7 +598,6 @@ function renderPantry() {
   const el = $('#s-pantry');
   const dateStr = new Date().toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'short' });
   let h = '<div class="head"><div><div class="sub">' + esc(dateStr) + (ui.engine ? ' · ' + (ui.engine === 'gemini' ? 'Gemini' : ui.engine === 'claude' ? 'Claude' : 'Demo mode') : '') + '</div><h1>Your kitchen</h1></div><div style="display:flex;gap:8px">' +
-    '<button class="icon-btn" id="open-settings" aria-label="AI and demo mode settings"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M2 12h3M19 12h3M4.9 19.1L7 17M17 7l2.1-2.1"/></svg></button>' +
     '<button class="icon-btn" id="add-item" aria-label="Add an item by hand"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></button></div></div>';
 
   if (!S.items.length) {
@@ -697,7 +665,6 @@ function bindPantry() {
     setTimeout(() => { S.shopping.splice(k, 1); save(); renderPantry(); toast('Ticked off ' + name); }, 250);
   }));
   const a = $('#add-item'); if (a) a.onclick = () => openItem(null);
-  const st = $('#open-settings'); if (st) st.onclick = openSettings;
   const g = $('#go-add'); if (g) g.onclick = () => goTab(1);
   const c = $('#cook-cta'); if (c) c.onclick = () => goTab(2);
   const s = $('#load-sample'); if (s) s.onclick = loadSample;
@@ -1054,7 +1021,7 @@ async function suggestMeals() {
     }).filter(Boolean);
     ui.meals = meals;
     ui.mealsNote = dropped ? dropped + (dropped === 1 ? ' idea was' : ' ideas were') + ' left out because ' + (dropped === 1 ? 'it' : 'they') + ' needed ingredients you don’t have marked use-first.' : '';
-    if (!sample) ui.mealsNote = 'Demo mode: simple template recipes. Connect Gemini in Settings for real ideas.' + (ui.mealsNote ? ' ' + ui.mealsNote : '');
+    if (!sample) ui.mealsNote = 'Demo mode: simple template recipes.' + (ui.mealsNote ? ' ' + ui.mealsNote : '');
     if (!meals.length) mealsErr = 'No meal could be made from only these items. Try allowing basics, or flag a few more items to use first.';
   } catch (err) { if (err && err.code !== 'cancelled') mealsErr = errCopy(err); }
   mealsBusy = false; renderMeals();
@@ -1126,7 +1093,7 @@ function startListening(retried) {
   $('#vs-text').textContent = 'Say what changed, like “used the spinach and two eggs”'; $('#vs-text').classList.add('placeholder');
   if (!SR) {
     if (geminiOn() && window.MediaRecorder && navigator.mediaDevices && window.isSecureContext) { startRecording(); return; }
-    vMode('typing', { msg: 'This browser can’t turn speech into text by itself (try Chrome, Edge or Safari, or connect Gemini in Settings). Type below, or tap the mic on your phone’s keyboard to dictate.' }); return;
+    vMode('typing', { msg: 'This browser can’t turn speech into text by itself (try Chrome, Edge or Safari). Type below, or tap the mic on your phone’s keyboard to dictate.' }); return;
   }
   let r;
   try {
